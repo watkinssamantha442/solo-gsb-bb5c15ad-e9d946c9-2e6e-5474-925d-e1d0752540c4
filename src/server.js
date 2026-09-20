@@ -7,6 +7,19 @@ const { solve, buildReport, buildExport, SolverError } = require('./solver');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+// 最小解锁恢复诊断的节点预算（可用环境变量覆盖；缺省由求解器内置默认值决定）。
+const DIAGNOSTIC_NODE_BUDGET = Number(process.env.DIAGNOSTIC_NODE_BUDGET) || undefined;
+
+// 恢复方案的最差视型：全部约束中改后比值最低者（并列取靠前的约束）。
+function worstProfileOf(report) {
+  let worst = null;
+  for (const c of report.constraints) {
+    if (!worst || c.afterRatio < worst.ratio) {
+      worst = { profile: c.worstProfile, ratio: c.afterRatio };
+    }
+  }
+  return worst;
+}
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -26,7 +39,9 @@ app.post('/api/solve', (req, res) => {
       return res.status(400).json({ error: '缺少 payload（调色板 JSON）' });
     }
 
-    const result = solve(payload, locks);
+    const options = {};
+    if (DIAGNOSTIC_NODE_BUDGET) options.diagnosticNodeBudget = DIAGNOSTIC_NODE_BUDGET;
+    const result = solve(payload, locks, options);
 
     if (result.status === 'optimal') {
       result.report = buildReport(payload, locks, result.assignment);
@@ -34,6 +49,15 @@ app.post('/api/solve', (req, res) => {
     } else if (result.status === 'search-limit' && result.best) {
       result.report = buildReport(payload, locks, result.best.assignment);
       result.export = buildExport(payload, result.best.assignment);
+    }
+    // 最小解锁恢复：为每个返回集合补充改色明细报告与恢复后方案的最差视型。
+    if (result.recovery && Array.isArray(result.recovery.sets)) {
+      for (const set of result.recovery.sets) {
+        set.report = buildReport(payload, set.locks, set.assignment);
+        const worst = worstProfileOf(set.report);
+        set.worstProfile = worst ? worst.profile : null;
+        set.worstRatio = worst ? worst.ratio : null;
+      }
     }
     return res.json(result);
   } catch (err) {

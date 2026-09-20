@@ -29,11 +29,15 @@ const els = {
   conflictArea: $('conflictArea'),
   conflictIntro: $('conflictIntro'),
   conflictList: $('conflictList'),
+  recoveryArea: $('recoveryArea'),
+  recoveryIntro: $('recoveryIntro'),
+  recoveryList: $('recoveryList'),
   limitArea: $('limitArea'),
 };
 
 let parsed = null; // 最近一次成功解析的 JSON 对象
 let lastExport = null; // 最近一次最优解的导出对象
+let lastRecoverySets = null; // 最近一次无解诊断返回的最小解锁集合
 // 单调递增的前端状态版本号：每次新输入意图或求解开始时 +1。
 let inputVersion = 0;
 
@@ -110,8 +114,10 @@ function clearResultViews() {
   els.resultPlaceholder.textContent = '运行求解后在此查看结果。';
   els.resultArea.hidden = true;
   els.conflictArea.hidden = true;
+  els.recoveryArea.hidden = true;
   els.limitArea.hidden = true;
   lastExport = null;
+  lastRecoverySets = null;
 }
 
 // ---------- 前端校验 ----------
@@ -348,7 +354,9 @@ els.jsonInput.addEventListener('input', () => {
 
 // ---------- 求解（异步，版本保护） ----------
 
-els.solveBtn.addEventListener('click', async () => {
+els.solveBtn.addEventListener('click', doSolve);
+
+async function doSolve() {
   // 求解前以当前文本做一次权威提交（错误须持续可见且禁用按钮）。
   const committed = commitInput();
   const data = committed.data;
@@ -385,7 +393,7 @@ els.solveBtn.addEventListener('click', async () => {
   } finally {
     if (isCurrent(version)) els.solveBtn.disabled = false;
   }
-});
+}
 
 // ---------- 结果渲染 ----------
 
@@ -397,6 +405,7 @@ function renderResult(body) {
 
   if (body.status === 'unsatisfiable') {
     renderConflicts(body);
+    renderRecovery(body.recovery);
     return;
   }
 
@@ -586,6 +595,120 @@ function renderConflicts(body) {
     }
     els.conflictList.appendChild(li);
   }
+}
+
+// ---------- 最小解锁恢复 ----------
+
+// 渲染无解诊断结果：complete 列出最小解锁集合（含改色明细与最差视型），
+// incomplete 明确提示“诊断未完成”（不得误报无恢复方案），none 说明解锁无法恢复。
+function renderRecovery(recovery) {
+  if (!recovery) return;
+  els.recoveryArea.hidden = false;
+  els.recoveryList.innerHTML = '';
+
+  if (recovery.status === 'incomplete') {
+    els.recoveryIntro.textContent = '';
+    const warn = document.createElement('div');
+    warn.className = 'alert alert-warn';
+    warn.textContent =
+      recovery.message || '诊断未完成：诊断节点预算已耗尽，不能确定是否存在可恢复的解锁集合。';
+    els.recoveryList.appendChild(warn);
+    return;
+  }
+
+  if (recovery.status === 'none') {
+    els.recoveryIntro.textContent =
+      recovery.message || '已检查全部解锁组合：解锁令牌无法恢复可行。';
+    return;
+  }
+
+  if (recovery.status !== 'complete') return;
+
+  const sets = recovery.sets || [];
+  lastRecoverySets = sets;
+  els.recoveryIntro.textContent =
+    `最少解锁 ${recovery.minUnlocks} 个令牌即可恢复可行；共 ${recovery.totalSets} 个最小解锁集合` +
+    (recovery.truncated ? `，按令牌名排序仅显示前 ${sets.length} 个` : '') +
+    `。（诊断节点 ${recovery.stats.nodes.toLocaleString('zh-CN')} / ` +
+    `预算 ${recovery.diagnosticNodeBudget.toLocaleString('zh-CN')}）`;
+
+  sets.forEach((set, i) => {
+    const card = document.createElement('div');
+    card.className = 'recovery-set';
+
+    const head = document.createElement('div');
+    head.className = 'recovery-head';
+    const title = document.createElement('strong');
+    title.textContent = `集合 ${i + 1}（解锁 ${set.unlock.length} 个令牌）`;
+    const chips = document.createElement('span');
+    chips.className = 'unlock-chips';
+    for (const name of set.unlock) {
+      const chip = document.createElement('span');
+      chip.className = 'unlock-chip';
+      chip.textContent = '🔓 ' + name;
+      chips.appendChild(chip);
+    }
+    head.append(title, chips);
+    card.appendChild(head);
+
+    // 改色明细（恢复后最优配色中发生改色的令牌）。
+    if (set.report) {
+      const changed = set.report.tokens.filter((t) => t.changed);
+      if (changed.length > 0) {
+        card.appendChild(
+          buildTable(
+            ['改色令牌', '原色', '', '改后', 'ΔE'],
+            changed.map((t) => [
+              t.name,
+              colorCell(t.original),
+              '→',
+              colorCell(t.final),
+              { num: t.deltaE.toFixed(2) },
+            ])
+          )
+        );
+      } else {
+        const none = document.createElement('p');
+        none.className = 'hint';
+        none.textContent = '解锁后无需改色即可满足全部约束。';
+        card.appendChild(none);
+      }
+    }
+
+    // 恢复后方案的最差视型。
+    if (set.worstProfile) {
+      const worstLine = document.createElement('p');
+      worstLine.className = 'hint recovery-worst';
+      const label = PROFILE_LABELS[set.worstProfile] || set.worstProfile;
+      worstLine.textContent =
+        `最差视型：${label}（改后最低对比度 ${Number(set.worstRatio).toFixed(2)}:1）`;
+      card.appendChild(worstLine);
+    }
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-primary';
+    btn.textContent = '设为未锁定并重新求解';
+    btn.addEventListener('click', () => applyUnlockSet(i));
+    card.appendChild(btn);
+
+    els.recoveryList.appendChild(card);
+  });
+}
+
+// 一键应用某个解锁集合：把集合中的令牌设为未锁定，同步回输入后立即重新求解。
+function applyUnlockSet(index) {
+  const set = (lastRecoverySets || [])[index];
+  if (!set || !parsed) return;
+  const unlock = new Set(set.unlock);
+  for (const t of parsed.tokens) {
+    if (unlock.has(t.name)) t.locked = false;
+  }
+  // 解锁状态同步回文本框中的 JSON，并按新版本统一提交（在途的旧求解响应会被丢弃）。
+  syncParsedIntoText();
+  beginInput();
+  commitInput();
+  doSolve();
 }
 
 // ---------- 导出 ----------

@@ -6,7 +6,9 @@
 //  2. JSON 语法错误同样持续可见（不再被清理旧结果的逻辑瞬间隐藏）；
 //  3. 异步乱序：较早开始的文件读取 / 示例请求 / 求解响应均不得覆盖更新后的输入；
 //  4. 服务端 400 错误持续可见，直至下次有效提交；
-//  5. 正常求解端到端可用。
+//  5. 正常求解端到端可用；
+//  6. 最小解锁恢复：无解时列出最小解锁集合、可一键解锁重解；
+//     诊断未完成与无恢复方案分别如实展示。
 
 const { test, expect } = require('@playwright/test');
 
@@ -28,6 +30,34 @@ function minimalPalette(overrides = {}) {
 }
 
 const UNKNOWN_PROFILE_PALETTE = minimalPalette({ profiles: ['normal', 'achromatopsia'] });
+
+// 两端锁定且对比度不足（#eeeeee / #ffffff 约 1.16:1）：解锁任一侧即可恢复。
+const LOCKED_CONFLICT_PALETTE = JSON.stringify(
+  {
+    tokens: [
+      { name: 'a', color: '#eeeeee', locked: true },
+      { name: 'b', color: '#ffffff', locked: true },
+    ],
+    candidates: ['#000000'],
+    constraints: [{ foreground: 'a', background: 'b', minContrast: 4.5 }],
+  },
+  null,
+  2
+);
+
+// 候选色本身不足：即使解锁全部令牌也不存在可行方案。
+const UNRECOVERABLE_PALETTE = JSON.stringify(
+  {
+    tokens: [
+      { name: 'a', color: '#777777', locked: true },
+      { name: 'b', color: '#888888' },
+    ],
+    candidates: ['#999999'],
+    constraints: [{ foreground: 'a', background: 'b', minContrast: 4.5 }],
+  },
+  null,
+  2
+);
 
 async function fillInput(page, text) {
   await page.locator('#jsonInput').fill(text);
@@ -242,5 +272,87 @@ test.describe('服务端错误与正常求解', () => {
     // 零改色：#ffffff / #000000 原本即达标。
     await expect(page.locator('#resultSummary')).toContainText('0');
     await expect(page.locator('#solveBtn')).toBeEnabled();
+  });
+});
+
+test.describe('最小解锁恢复', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/');
+  });
+
+  test('无解时列出最小解锁集合，一键设为未锁定后重新求解成功', async ({ page }) => {
+    await fillInput(page, LOCKED_CONFLICT_PALETTE);
+    await page.locator('#solveBtn').click();
+
+    // 冲突列表与恢复区域同时展示。
+    await expect(page.locator('#conflictArea')).toBeVisible();
+    await expect(page.locator('#recoveryArea')).toBeVisible();
+    await expect(page.locator('#recoveryIntro')).toContainText('最少解锁 1 个令牌');
+    await expect(page.locator('#recoveryIntro')).toContainText('共 2 个最小解锁集合');
+
+    // 两个最小集合按令牌名排序：['a'] 在前、['b'] 在后。
+    const cards = page.locator('.recovery-set');
+    await expect(cards).toHaveCount(2);
+    await expect(cards.nth(0).locator('.unlock-chip')).toHaveText(['🔓 a']);
+    await expect(cards.nth(1).locator('.unlock-chip')).toHaveText(['🔓 b']);
+    // 每项展示改色明细与最差视型。
+    await expect(cards.nth(0)).toContainText('#eeeeee');
+    await expect(cards.nth(0)).toContainText('#000000');
+    await expect(cards.nth(0)).toContainText('最差视型');
+
+    // 一键应用第一个集合（解锁 a）并重新求解。
+    await cards.nth(0).getByRole('button', { name: '设为未锁定并重新求解' }).click();
+
+    // 输入 JSON 中 a 已解锁，求解结果正常渲染，恢复区被清理。
+    await expect(page.locator('#jsonInput')).toHaveValue(/"name": "a"[\s\S]*?"locked": false/);
+    await expect(page.locator('#resultArea')).toBeVisible();
+    await expect(page.locator('#resultSummary')).toContainText('改色令牌数');
+    await expect(page.locator('#recoveryArea')).toBeHidden();
+    await expect(page.locator('#conflictArea')).toBeHidden();
+  });
+
+  test('全部解锁仍无解时明确提示无恢复方案', async ({ page }) => {
+    await fillInput(page, UNRECOVERABLE_PALETTE);
+    await page.locator('#solveBtn').click();
+
+    await expect(page.locator('#recoveryArea')).toBeVisible();
+    await expect(page.locator('#recoveryIntro')).toContainText('全部解锁');
+    await expect(page.locator('.recovery-set')).toHaveCount(0);
+  });
+
+  test('诊断未完成时展示预算警告而非无恢复方案', async ({ page }) => {
+    // 模拟服务端在诊断节点预算耗尽时的响应。
+    await page.route('**/api/solve', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          status: 'unsatisfiable',
+          reason: 'locked-conflict',
+          profiles: ['normal'],
+          conflicts: [],
+          stats: { nodes: 0, elapsedMs: 0 },
+          recovery: {
+            status: 'incomplete',
+            reason: 'diagnostic-node-budget',
+            diagnosticNodeBudget: 4000000,
+            message:
+              '诊断未完成：诊断节点预算（4000000）已耗尽，' +
+              '无法确定是否存在可恢复可行的最小解锁集合；这不代表没有恢复方案。',
+            stats: { nodes: 4000001, elapsedMs: 123 },
+          },
+        }),
+      })
+    );
+
+    await fillInput(page, LOCKED_CONFLICT_PALETTE);
+    await page.locator('#solveBtn').click();
+
+    await expect(page.locator('#recoveryArea')).toBeVisible();
+    await expect(page.locator('#recoveryArea .alert-warn')).toContainText('诊断未完成');
+    await expect(page.locator('#recoveryArea .alert-warn')).toContainText('不代表没有恢复方案');
+    // 不得出现解锁集合卡片或“无恢复方案”字样。
+    await expect(page.locator('.recovery-set')).toHaveCount(0);
+    await expect(page.locator('#recoveryIntro')).toHaveText('');
   });
 });

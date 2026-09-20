@@ -1,7 +1,15 @@
 'use strict';
-// 求解器行为测试：锁定冲突、全局无解、决胜顺序、上限校验、自反约束、零改色、色觉鲁棒模式。
+// 求解器行为测试：锁定冲突、全局无解、决胜顺序、上限校验、自反约束、零改色、
+// 色觉鲁棒模式、最小解锁恢复诊断。
 const assert = require('assert');
-const { solve, buildReport, parseModel, SolverError } = require('../src/solver');
+const {
+  solve,
+  buildReport,
+  parseModel,
+  SolverError,
+  DEFAULT_DIAGNOSTIC_NODE_BUDGET,
+  MAX_RECOVERY_SETS,
+} = require('../src/solver');
 
 function base(overrides = {}) {
   return {
@@ -326,6 +334,209 @@ assert.throws(
   const report = buildReport(input, null, r.assignment);
   assert.strictEqual(report.constraints[0].perProfile.length, 4);
   assert.ok(report.constraints[0].afterPass);
+}
+
+// 18. 最小解锁恢复：两端锁定冲突 -> 最小解锁集合按令牌名排序，且附带恢复后的最优配色。
+{
+  const input = {
+    tokens: [
+      { name: 'a', color: '#eeeeee', locked: true },
+      { name: 'b', color: '#ffffff', locked: true },
+    ],
+    candidates: ['#000000'],
+    constraints: [{ foreground: 'a', background: 'b', minContrast: 4.5 }],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.reason, 'locked-conflict');
+  assert.ok(r.recovery);
+  assert.strictEqual(r.recovery.status, 'complete');
+  assert.strictEqual(r.recovery.minUnlocks, 1);
+  assert.strictEqual(r.recovery.totalSets, 2);
+  assert.strictEqual(r.recovery.truncated, false);
+  assert.strictEqual(r.recovery.diagnosticNodeBudget, DEFAULT_DIAGNOSTIC_NODE_BUDGET);
+  assert.deepStrictEqual(r.recovery.sets.map((s) => s.unlock), [['a'], ['b']]);
+
+  // 每个集合都给出按原优化目标重算的最优配色：解锁侧改为 #000000。
+  const setA = r.recovery.sets[0];
+  assert.strictEqual(setA.assignment.a, '#000000');
+  assert.strictEqual(setA.assignment.b, '#ffffff');
+  assert.strictEqual(setA.changes, 1);
+  // locks 字段是应用该集合后的完整锁定状态，可直接用于重放。
+  assert.deepStrictEqual(setA.locks, { a: false, b: true });
+  const replay = solve(input, setA.locks);
+  assert.strictEqual(replay.status, 'optimal');
+  assert.deepStrictEqual(replay.assignment, setA.assignment);
+  // 恢复后的配色确实可行。
+  const report = buildReport(input, setA.locks, setA.assignment);
+  assert.ok(report.constraints.every((c) => c.afterPass));
+}
+
+// 19. 仅保留可恢复可行的集合：与冲突无关的锁定令牌不出现在集合中。
+{
+  const input = {
+    tokens: [
+      { name: 'a', color: '#eeeeee', locked: true },
+      { name: 'b', color: '#ffffff', locked: true },
+      { name: 'c', color: '#ffffff', locked: true }, // 无约束，解锁它无济于事
+    ],
+    candidates: ['#000000'],
+    constraints: [{ foreground: 'a', background: 'b', minContrast: 4.5 }],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.recovery.status, 'complete');
+  assert.strictEqual(r.recovery.minUnlocks, 1);
+  assert.strictEqual(r.recovery.totalSets, 2);
+  assert.deepStrictEqual(r.recovery.sets.map((s) => s.unlock), [['a'], ['b']]);
+}
+
+// 20. 截断：最小集合超过 5 个时仅返回前 5 个并标记 truncated，排序稳定。
+{
+  const tokens = [];
+  const constraints = [];
+  for (const i of [1, 2, 3]) {
+    tokens.push({ name: 'p' + i, color: '#eeeeee', locked: true });
+    tokens.push({ name: 'q' + i, color: '#ffffff', locked: true });
+    constraints.push({ foreground: 'p' + i, background: 'q' + i, minContrast: 4.5 });
+  }
+  const r = solve({ tokens, candidates: ['#000000'], constraints });
+  assert.strictEqual(r.recovery.status, 'complete');
+  assert.strictEqual(r.recovery.minUnlocks, 3);
+  assert.strictEqual(r.recovery.totalSets, 8);
+  assert.strictEqual(r.recovery.truncated, true);
+  assert.strictEqual(r.recovery.sets.length, MAX_RECOVERY_SETS);
+  assert.deepStrictEqual(r.recovery.sets[0].unlock, ['p1', 'p2', 'p3']);
+  assert.deepStrictEqual(r.recovery.sets[4].unlock, ['p2', 'p3', 'q1']);
+  // 集合之间按令牌名序列稳定排序。
+  const keys = r.recovery.sets.map((s) => s.unlock.join('|'));
+  assert.deepStrictEqual(keys, [...keys].sort());
+  // 每个返回集合的配色都恢复可行。
+  for (const set of r.recovery.sets) {
+    assert.strictEqual(set.changes, 3);
+    const report = buildReport({ tokens, candidates: ['#000000'], constraints }, set.locks, set.assignment);
+    assert.ok(report.constraints.every((c) => c.afterPass));
+  }
+}
+
+// 21. 诊断节点预算耗尽 -> 诊断未完成，不得误报无恢复方案。
+{
+  const input = {
+    tokens: [
+      { name: 'a', color: '#eeeeee', locked: true },
+      { name: 'b', color: '#ffffff', locked: true },
+    ],
+    candidates: ['#000000'],
+    constraints: [{ foreground: 'a', background: 'b', minContrast: 4.5 }],
+  };
+  const r = solve(input, null, { diagnosticNodeBudget: 1 });
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.recovery.status, 'incomplete');
+  assert.strictEqual(r.recovery.reason, 'diagnostic-node-budget');
+  assert.strictEqual(r.recovery.sets, undefined);
+  assert.ok(r.recovery.message.includes('诊断未完成'));
+  assert.ok(r.recovery.message.includes('不代表没有恢复方案'));
+}
+
+// 22. 存在锁定令牌但全部解锁仍无解 -> none（候选色本身不足）。
+{
+  const input = {
+    tokens: [
+      { name: 'a', color: '#777777', locked: true },
+      { name: 'b', color: '#888888' },
+    ],
+    candidates: ['#999999'],
+    constraints: [{ foreground: 'a', background: 'b', minContrast: 4.5 }],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.recovery.status, 'none');
+  assert.ok(r.recovery.message.includes('全部解锁'));
+}
+
+// 23. 全局无解（无直接锁定冲突）且存在锁定令牌：解锁可恢复。
+{
+  // a 锁定为 #ff0000（仅与 #000000 达标），b、c 被迫同取 #000000 而互相冲突；
+  // 解锁 a 后 a 可取 #767676（与黑、白均 >= 4.5），三角约束恢复可行。
+  const input = {
+    tokens: [
+      { name: 'a', color: '#ff0000', locked: true },
+      { name: 'b', color: '#000000' },
+      { name: 'c', color: '#ffffff' },
+    ],
+    candidates: ['#000000', '#767676', '#ffffff'],
+    constraints: [
+      { foreground: 'a', background: 'b', minContrast: 4.5 },
+      { foreground: 'b', background: 'c', minContrast: 4.5 },
+      { foreground: 'a', background: 'c', minContrast: 4.5 },
+    ],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.reason, 'global');
+  assert.strictEqual(r.recovery.status, 'complete');
+  assert.strictEqual(r.recovery.minUnlocks, 1);
+  assert.strictEqual(r.recovery.totalSets, 1);
+  assert.deepStrictEqual(r.recovery.sets.map((s) => s.unlock), [['a']]);
+  assert.strictEqual(r.recovery.sets[0].assignment.a, '#767676');
+  assert.strictEqual(r.recovery.sets[0].changes, 1);
+  assert.deepStrictEqual(r.recovery.sets[0].locks, { a: false, b: false, c: false });
+}
+
+// 24. 自反约束导致的无解：解锁无法恢复（recovery.status = none）。
+{
+  const r = solve({
+    tokens: [{ name: 'a', color: '#ffffff', locked: true }],
+    candidates: ['#000000'],
+    constraints: [{ foreground: 'a', background: 'a', minContrast: 2 }],
+  });
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.reason, 'direct-conflict');
+  assert.strictEqual(r.recovery.status, 'none');
+  assert.ok(r.recovery.message.includes('自反约束'));
+}
+
+// 25. 无锁定令牌时全局无解不提供解锁恢复字段。
+{
+  const r = solve({
+    tokens: [
+      { name: 'a', color: '#777777' },
+      { name: 'b', color: '#666666' },
+      { name: 'c', color: '#888888' },
+    ],
+    candidates: ['#707070', '#808080'],
+    constraints: [
+      { foreground: 'a', background: 'b', minContrast: 4.5 },
+      { foreground: 'b', background: 'c', minContrast: 4.5 },
+      { foreground: 'a', background: 'c', minContrast: 4.5 },
+    ],
+  });
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.reason, 'global');
+  assert.strictEqual(r.recovery, undefined);
+}
+
+// 26. 色觉鲁棒模式下的解锁恢复：仅解锁 text 可恢复，恢复后全视型达标。
+{
+  const input = {
+    tokens: [
+      { name: 'text', color: '#ff0000', locked: true },
+      { name: 'bg', color: '#000000', locked: true },
+    ],
+    candidates: ['#ffffff'],
+    constraints: [{ foreground: 'text', background: 'bg', minContrast: 4.5 }],
+    profiles: ['normal', 'protanopia'],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.recovery.status, 'complete');
+  assert.strictEqual(r.recovery.minUnlocks, 1);
+  // 解锁 bg 只能得到 #ffffff，与 #ff0000 对比度不足 -> 只有 ['text'] 一个集合。
+  assert.deepStrictEqual(r.recovery.sets.map((s) => s.unlock), [['text']]);
+  const set = r.recovery.sets[0];
+  assert.strictEqual(set.assignment.text, '#ffffff');
+  const report = buildReport(input, set.locks, set.assignment);
+  assert.ok(report.constraints.every((c) => c.afterPass));
+  assert.ok(report.constraints[0].perProfile.every((p) => p.afterPass));
 }
 
 console.log('全部求解器测试通过');

@@ -12,7 +12,8 @@
     <p class="subtitle">
       导入颜色令牌、候选色与 WCAG 对比度约束，锁定任意令牌后进行全局分支定界搜索：
       先最小化改色令牌数，再最小化 CIE Lab 总色差。可启用色觉鲁棒模式，要求每条约束
-      在正常视觉与所选色盲视型下同时达标。所有数据仅在本机浏览器与本地服务内存中处理。
+      在正常视觉与所选色盲视型下同时达标。无解且存在锁定令牌时，自动诊断解锁数量最少
+      的可恢复集合并支持一键解锁重解。所有数据仅在本机浏览器与本地服务内存中处理。
     </p>
   </header>
 
@@ -42,7 +43,7 @@
       <div id="parseError" class="alert alert-error" hidden></div>
 
       <h2 class="mt">2. 锁定令牌</h2>
-      <p class="hint">被锁定的令牌保留原色，不参与改色。</p>
+      <p class="hint">被锁定的令牌保留原色，不参与改色；无解时会自动诊断最少需要解锁哪些令牌才能恢复可行。</p>
       <div id="tokenLocks" class="lock-grid">
         <div class="hint" id="lockEmpty">尚未载入有效数据。</div>
       </div>
@@ -83,6 +84,12 @@
         <h3>无解：锁定颜色直接造成的冲突</h3>
         <p id="conflictIntro" class="hint"></p>
         <ul id="conflictList" class="conflict-list"></ul>
+      </div>
+
+      <div id="recoveryArea" hidden>
+        <h3>最小解锁恢复</h3>
+        <p id="recoveryIntro" class="hint"></p>
+        <div id="recoveryList"></div>
       </div>
 
       <div id="limitArea" class="alert alert-warn" hidden></div>

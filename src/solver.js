@@ -18,7 +18,9 @@
 //   - 以“当前改色数 + ΔE 增量”作为随路径单调递增的下界剪枝；
 //   - MRV（最小剩余值域）变量选择 + 基于相容位掩码的前向检查；
 //   - 每个变量先尝试原色：原方案可行时可立即得到零改色最优解；
-//   - 无解时先枚举由锁定颜色“直接”造成的冲突（含具体失败视型）。
+//   - 无解时先枚举由锁定颜色“直接”造成的冲突（含具体失败视型）；
+//   - 无解且存在锁定令牌时进一步做“最小解锁恢复”诊断：在独立诊断节点预算内
+//     枚举解锁数量最少且能恢复可行的令牌集合（见 diagnoseUnlockRecovery）。
 
 const {
   normalizeHex,
@@ -32,6 +34,10 @@ const MAX_TOKENS = 10;
 const MAX_CANDIDATES = 12;
 const MAX_CONSTRAINTS = 30;
 const DEFAULT_NODE_BUDGET = 2_000_000;
+// 最小解锁恢复诊断的独立节点预算（跨全部子集搜索累计消耗）。
+const DEFAULT_DIAGNOSTIC_NODE_BUDGET = 4_000_000;
+// 诊断返回的最小解锁集合数量上限。
+const MAX_RECOVERY_SETS = 5;
 
 class SolverError extends Error {}
 
@@ -174,6 +180,7 @@ function parseModel(input, locks) {
     domain.add(token.original);
     const sorted = [...domain].sort();
     token.domain = token.locked ? [token.original] : sorted;
+    token.unlockedDomain = sorted; // 解锁后的完整值域（解锁诊断派生模型时复用）
     token.originalIndex = sorted.indexOf(token.original);
   }
 
@@ -379,6 +386,10 @@ function countBits(mask) {
  */
 function runSearch(model, pre, options = {}) {
   const nodeBudget = options.nodeBudget || DEFAULT_NODE_BUDGET;
+  // 可行性判定模式：找到首个可行解即停止（用于解锁诊断的子集筛选）。
+  const feasibilityOnly = options.feasibilityOnly === true;
+  // 可传入共享预算对象（{ remaining }），跨多次搜索累计消耗（诊断节点预算）。
+  const budgetState = options.sharedBudget || { remaining: nodeBudget };
 
   // 未锁定变量，按令牌名升序排列（顺序确定性）。
   const varNames = model.tokenNames.filter((name) => !model.tokens.get(name).locked).sort();
@@ -460,7 +471,9 @@ function runSearch(model, pre, options = {}) {
    */
   const dfs = (pos, domains, changes, deltaSum) => {
     if (earlyStop) return;
-    if (++nodes > nodeBudget) {
+    nodes += 1;
+    budgetState.remaining -= 1;
+    if (budgetState.remaining < 0) {
       budgetExceeded = true;
       return;
     }
@@ -473,7 +486,8 @@ function runSearch(model, pre, options = {}) {
 
     if (pos === vcount) {
       recordSolution(changes, deltaSum);
-      if (incumbent.changes === 0) earlyStop = true; // 零改色即全局最优
+      // 可行性判定模式下首个可行解即足够；零改色即全局最优。
+      if (feasibilityOnly || incumbent.changes === 0) earlyStop = true;
       return;
     }
 
@@ -602,6 +616,165 @@ function runSearch(model, pre, options = {}) {
 }
 
 /**
+ * 生成 sortedNames 的全部 k 元组合（按字典序产出，每个组合内部保持升序）。
+ */
+function* combinations(sortedNames, k) {
+  const n = sortedNames.length;
+  if (k < 1 || k > n) return;
+  const idx = [];
+  for (let i = 0; i < k; i++) idx.push(i);
+  for (;;) {
+    yield idx.map((i) => sortedNames[i]);
+    let i = k - 1;
+    while (i >= 0 && idx[i] === n - k + i) i -= 1;
+    if (i < 0) return;
+    idx[i] += 1;
+    for (let j = i + 1; j < k; j++) idx[j] = idx[j - 1] + 1;
+  }
+}
+
+/** 按令牌名序列比较两个解锁集合（稳定排序用）。 */
+function compareUnlockSets(a, b) {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    if (a[i] < b[i]) return -1;
+    if (a[i] > b[i]) return 1;
+  }
+  return a.length - b.length;
+}
+
+/**
+ * 派生模型：仅把 unlockNames 中的令牌改为未锁定（值域恢复为完整值域），
+ * 候选色、约束与视型保持不变。
+ */
+function deriveModelWithUnlocks(model, unlockNames) {
+  const unlock = new Set(unlockNames);
+  const tokens = new Map();
+  for (const [name, token] of model.tokens) {
+    const locked = token.locked && !unlock.has(name);
+    tokens.set(name, {
+      ...token,
+      locked,
+      domain: locked ? [token.original] : token.unlockedDomain,
+    });
+  }
+  return { ...model, tokens };
+}
+
+/** 应用解锁集合后的完整锁定状态（{ [令牌名]: 是否锁定 }），可直接作为 locks 重放。 */
+function locksAfterUnlock(model, unlockNames) {
+  const unlock = new Set(unlockNames);
+  const locks = {};
+  for (const name of model.tokenNames) {
+    locks[name] = model.tokens.get(name).locked && !unlock.has(name);
+  }
+  return locks;
+}
+
+/**
+ * 最小解锁恢复诊断：在独立诊断节点预算内，枚举能恢复可行的解锁集合中数量最少者。
+ * 不改变候选色、约束与视型，仅调整令牌的锁定状态。
+ *
+ * 返回：
+ *  - null：没有锁定令牌，无需诊断；
+ *  - { status: 'complete', minUnlocks, totalSets, truncated, sets, ... }：
+ *    sets 为按令牌名序列稳定排序的前 MAX_RECOVERY_SETS 个可恢复集合，
+ *    每个集合附带按原优化目标（最少改色、最小 ΔE、稳定决胜）重算的最优配色；
+ *  - { status: 'none' }：完整枚举全部组合后确认任何解锁方式都无法恢复可行；
+ *  - { status: 'incomplete' }：诊断节点预算耗尽，诊断未完成
+ *    （不得据此声称无恢复方案）。
+ */
+function diagnoseUnlockRecovery(model, activeConstraints, options = {}) {
+  const lockedNames = model.tokenNames
+    .filter((name) => model.tokens.get(name).locked)
+    .sort();
+  if (lockedNames.length === 0) return null;
+
+  const nodeBudget =
+    Number.isInteger(options.diagnosticNodeBudget) && options.diagnosticNodeBudget > 0
+      ? options.diagnosticNodeBudget
+      : DEFAULT_DIAGNOSTIC_NODE_BUDGET;
+  const sharedBudget = { remaining: nodeBudget };
+  const startTime = Date.now();
+  let nodes = 0;
+
+  const stats = () => ({ nodes, elapsedMs: Date.now() - startTime });
+  const incomplete = () => ({
+    status: 'incomplete',
+    reason: 'diagnostic-node-budget',
+    diagnosticNodeBudget: nodeBudget,
+    message:
+      `诊断未完成：诊断节点预算（${nodeBudget}）已耗尽，` +
+      '无法确定是否存在可恢复可行的最小解锁集合；这不代表没有恢复方案。',
+    stats: stats(),
+  });
+
+  const searchWithUnlocks = (unlockNames, feasibilityOnly) => {
+    const derived = deriveModelWithUnlocks(model, unlockNames);
+    const pre = preprocess(derived, activeConstraints);
+    // 与 solve 主流程一致：仍为锁定状态的令牌之间（或锁定侧与对端值域）的
+    // 直接冲突立即判定不可行——搜索本身不检查两端都锁定的约束。
+    if (findDirectLockConflicts(derived, activeConstraints, pre).length > 0) {
+      return { status: 'unsatisfiable', stats: { nodes: 0, elapsedMs: 0 } };
+    }
+    const r = runSearch(derived, pre, { sharedBudget, feasibilityOnly });
+    nodes += r.stats.nodes;
+    return r;
+  };
+
+  // 按解锁数量从小到大枚举；首个存在可行集合的规模即最少解锁数。
+  let feasibleSets = null;
+  for (let k = 1; k <= lockedNames.length && feasibleSets === null; k++) {
+    const feasible = [];
+    for (const combo of combinations(lockedNames, k)) {
+      const r = searchWithUnlocks(combo, true);
+      if (r.status === 'search-limit') return incomplete();
+      if (r.status === 'optimal') feasible.push(combo);
+    }
+    if (feasible.length > 0) feasibleSets = feasible;
+  }
+
+  if (feasibleSets === null) {
+    return {
+      status: 'none',
+      diagnosticNodeBudget: nodeBudget,
+      message:
+        '已枚举全部锁定令牌的解锁组合：即使全部解锁，' +
+        '当前候选色与约束下也不存在可行方案。',
+      stats: stats(),
+    };
+  }
+
+  // 组合按字典序生成，过滤后已按令牌名序列有序；显式排序保证稳定。
+  feasibleSets.sort(compareUnlockSets);
+  const top = feasibleSets.slice(0, MAX_RECOVERY_SETS);
+
+  // 每个返回集合：复用原优化目标重算恢复后的最优配色。
+  const sets = [];
+  for (const combo of top) {
+    const r = searchWithUnlocks(combo, false);
+    if (r.status === 'search-limit') return incomplete();
+    sets.push({
+      unlock: combo,
+      locks: locksAfterUnlock(model, combo),
+      assignment: r.assignment,
+      changes: r.changes,
+      totalDelta: r.totalDelta,
+    });
+  }
+
+  return {
+    status: 'complete',
+    minUnlocks: feasibleSets[0].length,
+    totalSets: feasibleSets.length,
+    truncated: feasibleSets.length > sets.length,
+    diagnosticNodeBudget: nodeBudget,
+    sets,
+    stats: stats(),
+  };
+}
+
+/**
  * 求解入口。返回值可直接序列化为 API 响应。
  */
 function solve(input, locks, options = {}) {
@@ -632,31 +805,44 @@ function solve(input, locks, options = {}) {
     }
   }
   if (selfConflicts.length > 0) {
-    return {
+    const response = {
       status: 'unsatisfiable',
       reason: 'direct-conflict',
       profiles: model.profiles,
       conflicts: selfConflicts,
       stats: { nodes: 0, elapsedMs: 0 },
     };
+    // 自反约束对任何颜色都不可能达到 >1 的对比度，解锁令牌无法恢复可行。
+    if (model.tokenNames.some((name) => model.tokens.get(name).locked)) {
+      response.recovery = {
+        status: 'none',
+        message:
+          '存在前景与背景相同的自反约束：任何颜色与自身的对比度恒为 1，' +
+          '解锁令牌无法恢复可行。',
+      };
+    }
+    return response;
   }
 
   const pre = preprocess(model, activeConstraints);
 
   const directConflicts = findDirectLockConflicts(model, activeConstraints, pre);
   if (directConflicts.length > 0) {
-    return {
+    const response = {
       status: 'unsatisfiable',
       reason: 'locked-conflict',
       profiles: model.profiles,
       conflicts: directConflicts,
       stats: { nodes: 0, elapsedMs: 0 },
     };
+    const recovery = diagnoseUnlockRecovery(model, activeConstraints, options);
+    if (recovery) response.recovery = recovery;
+    return response;
   }
 
   const result = runSearch(model, pre, options);
   if (result.status === 'unsatisfiable') {
-    return {
+    const response = {
       status: 'unsatisfiable',
       reason: 'global',
       profiles: model.profiles,
@@ -666,6 +852,9 @@ function solve(input, locks, options = {}) {
         '不可行性可能由多条约束与候选色范围共同造成。',
       stats: result.stats,
     };
+    const recovery = diagnoseUnlockRecovery(model, activeConstraints, options);
+    if (recovery) response.recovery = recovery;
+    return response;
   }
   if (result.status === 'search-limit') {
     return {
@@ -773,9 +962,12 @@ module.exports = {
   MAX_TOKENS,
   MAX_CANDIDATES,
   MAX_CONSTRAINTS,
+  DEFAULT_DIAGNOSTIC_NODE_BUDGET,
+  MAX_RECOVERY_SETS,
   SolverError,
   parseModel,
   solve,
+  diagnoseUnlockRecovery,
   buildReport,
   buildExport,
 };

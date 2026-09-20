@@ -239,6 +239,39 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .conflict-list { padding-left: 18px; margin: 8px 0 0; }
 .conflict-list li { margin-bottom: 10px; color: var(--bad); font-size: 13.5px; }
 
+/* 最小解锁恢复 */
+.recovery-set {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 10px;
+  background: #f8fafc;
+}
+
+.recovery-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.unlock-chips { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+
+.unlock-chip {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: #eff6ff;
+  color: var(--primary-dark);
+  border: 1px solid #bfdbfe;
+}
+
+.recovery-set .btn { margin-top: 8px; }
+.recovery-worst { margin: 8px 0 0; }
+
 .app-footer {
   max-width: 1280px;
   margin: 0 auto;
