@@ -6,7 +6,9 @@
 //  2. JSON 语法错误同样持续可见（不再被清理旧结果的逻辑瞬间隐藏）；
 //  3. 异步乱序：较早开始的文件读取 / 示例请求 / 求解响应均不得覆盖更新后的输入；
 //  4. 服务端 400 错误持续可见，直至下次有效提交；
-//  5. 正常求解端到端可用。
+//  5. 正常求解端到端可用；
+//  6. 最小解锁恢复：无解时展示最小解锁集合、可一键应用并重新求解；
+//     全部解锁仍无解时明确提示无恢复方案。
 
 const { test, expect } = require('@playwright/test');
 
@@ -242,5 +244,90 @@ test.describe('服务端错误与正常求解', () => {
     // 零改色：#ffffff / #000000 原本即达标。
     await expect(page.locator('#resultSummary')).toContainText('0');
     await expect(page.locator('#solveBtn')).toBeEnabled();
+  });
+});
+
+test.describe('最小解锁恢复', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/');
+  });
+
+  // 两端锁定且对比度 4.48 < 4.5：无解；解锁 bg 或 text 均可恢复。
+  const LOCKED_CONFLICT_PALETTE = JSON.stringify(
+    {
+      tokens: [
+        { name: 'text', color: '#777777', locked: true },
+        { name: 'bg', color: '#ffffff', locked: true },
+      ],
+      candidates: ['#000000'],
+      constraints: [{ foreground: 'text', background: 'bg', minContrast: 4.5 }],
+    },
+    null,
+    2
+  );
+
+  test('无解时展示最小解锁集合，一键应用后自动重新求解', async ({ page }) => {
+    await fillInput(page, LOCKED_CONFLICT_PALETTE);
+    await page.locator('#solveBtn').click();
+
+    // 冲突列表与恢复区域均可见。
+    await expect(page.locator('#conflictArea')).toBeVisible();
+    await expect(page.locator('#recoveryArea')).toBeVisible();
+    await expect(page.locator('#recoveryIntro')).toContainText('解锁最少 1 个');
+    await expect(page.locator('#recoveryIntro')).toContainText('共 2 个最小解锁集合');
+    await expect(page.locator('#recoveryMeta')).toContainText('诊断节点');
+
+    // 两个最小集合，按令牌名序列排序：第一个为 bg。
+    const cards = page.locator('.recovery-card');
+    await expect(cards).toHaveCount(2);
+    await expect(cards.nth(0).locator('.unlock-chip')).toContainText('bg');
+    await expect(cards.nth(1).locator('.unlock-chip')).toContainText('text');
+    // 每个集合展示改色明细与最差视型。
+    await expect(cards.nth(0)).toContainText('最差视型');
+    await expect(cards.nth(0)).toContainText('#000000');
+
+    // 一键应用第一个集合（解锁 bg）：自动重新求解并得到可行结果。
+    await cards.nth(0).locator('.recovery-apply').click();
+    await expect(page.locator('#resultArea')).toBeVisible();
+    await expect(page.locator('#resultSummary')).toContainText('改色令牌数');
+    // 恢复区域随新求解被清理。
+    await expect(page.locator('#recoveryArea')).toBeHidden();
+
+    // 锁定面板同步：text 仍锁定，bg 已解锁。
+    const items = page.locator('#tokenLocks .lock-item');
+    await expect(items.nth(0)).toHaveClass(/is-locked/);
+    await expect(items.nth(1)).not.toHaveClass(/is-locked/);
+
+    // 文本框中的 JSON 同步为 bg.locked = false。
+    const data = JSON.parse(await page.locator('#jsonInput').inputValue());
+    expect(data.tokens.find((t) => t.name === 'bg').locked).toBe(false);
+    expect(data.tokens.find((t) => t.name === 'text').locked).toBe(true);
+  });
+
+  test('全部解锁仍无解时明确提示无恢复方案', async ({ page }) => {
+    // 三角约束全局无解（与锁定无关），但存在一个锁定令牌以触发诊断。
+    const palette = JSON.stringify(
+      {
+        tokens: [
+          { name: 'a', color: '#777777', locked: true },
+          { name: 'b', color: '#666666' },
+          { name: 'c', color: '#888888' },
+        ],
+        candidates: ['#707070', '#808080'],
+        constraints: [
+          { foreground: 'a', background: 'b', minContrast: 4.5 },
+          { foreground: 'b', background: 'c', minContrast: 4.5 },
+          { foreground: 'a', background: 'c', minContrast: 4.5 },
+        ],
+      },
+      null,
+      2
+    );
+    await fillInput(page, palette);
+    await page.locator('#solveBtn').click();
+
+    await expect(page.locator('#recoveryArea')).toBeVisible();
+    await expect(page.locator('#recoveryAlert')).toContainText('没有可用的解锁恢复方案');
+    await expect(page.locator('.recovery-card')).toHaveCount(0);
   });
 });

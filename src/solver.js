@@ -19,6 +19,16 @@
 //   - MRV（最小剩余值域）变量选择 + 基于相容位掩码的前向检查；
 //   - 每个变量先尝试原色：原方案可行时可立即得到零改色最优解；
 //   - 无解时先枚举由锁定颜色“直接”造成的冲突（含具体失败视型）。
+//
+// 最小解锁恢复诊断（无解且存在锁定令牌时自动触发）：
+//   - 不改变候选色、约束与视型，仅枚举“将哪些锁定令牌改为未锁定”；
+//   - 按解锁数量递增枚举组合，仅保留能恢复可行解的集合，第一组有解的
+//     解锁数量即最小解锁数，该数量下的全部可行集合即所有最小解锁集合；
+//   - 集合按解锁令牌名序列（升序元组）稳定排序，仅返回前 5 个并标注是否截断；
+//   - 每个返回集合复用原优化目标（最少改色 → 最小 ΔE → 稳定决胜）计算恢复后
+//     的最优配色，并附改色明细与最差视型；
+//   - 诊断使用独立的节点预算：预算耗尽时返回“诊断未完成”（incomplete），
+//     绝不误报“无恢复方案”（none 仅在完整证明后给出）。
 
 const {
   normalizeHex,
@@ -32,6 +42,9 @@ const MAX_TOKENS = 10;
 const MAX_CANDIDATES = 12;
 const MAX_CONSTRAINTS = 30;
 const DEFAULT_NODE_BUDGET = 2_000_000;
+// 最小解锁恢复诊断：独立的节点预算（全部解锁集合枚举共享）与返回条数上限。
+const DEFAULT_RECOVERY_NODE_BUDGET = 2_000_000;
+const MAX_RECOVERY_SETS = 5;
 
 class SolverError extends Error {}
 
@@ -168,11 +181,13 @@ function parseModel(input, locks) {
   });
 
   // 每个令牌的值域 = {原色} ∪ 候选色（去重、升序），原色位置单独记录。
+  // fullDomain 始终保留完整值域，供解锁恢复诊断在翻转锁定状态时复用。
   for (const name of tokenNames) {
     const token = tokens.get(name);
     const domain = new Set(candidates);
     domain.add(token.original);
     const sorted = [...domain].sort();
+    token.fullDomain = sorted;
     token.domain = token.locked ? [token.original] : sorted;
     token.originalIndex = sorted.indexOf(token.original);
   }
@@ -602,7 +617,254 @@ function runSearch(model, pre, options = {}) {
 }
 
 /**
+ * 按字典序枚举 sortedNames 的全部 k 元组合（生成器）。
+ * 输入已按令牌名升序排序时，产出顺序即“按解锁令牌名序列稳定排序”的顺序。
+ */
+function* combinations(sortedNames, k) {
+  const n = sortedNames.length;
+  const idx = Array.from({ length: k }, (_, i) => i);
+  for (;;) {
+    yield idx.map((i) => sortedNames[i]);
+    let i = k - 1;
+    while (i >= 0 && idx[i] === n - k + i) i--;
+    if (i < 0) return;
+    idx[i]++;
+    for (let j = i + 1; j < k; j++) idx[j] = idx[j - 1] + 1;
+  }
+}
+
+/**
+ * 为一个最小解锁集合组装诊断结果：
+ * 复用原优化目标得到的恢复后最优配色 + 改色明细（report）+ 最差视型摘要。
+ * locks 为应用该集合后的完整锁定表（前端可据此一键重新求解）。
+ */
+function buildRecoverySet(input, model, originallyLocked, unlock, searchResult) {
+  const unlockSet = new Set(unlock);
+  const locks = {};
+  for (const [name, locked] of originallyLocked) {
+    locks[name] = locked && !unlockSet.has(name);
+  }
+  const report = buildReport(input, locks, searchResult.assignment);
+
+  // 集合级最差视型：全部约束中改后比值最低的那条约束所标注的视型。
+  let worstProfile = null;
+  let worstRatio = null;
+  for (const c of report.constraints) {
+    if (worstRatio === null || c.afterRatio < worstRatio) {
+      worstRatio = c.afterRatio;
+      worstProfile = c.worstProfile;
+    }
+  }
+
+  return {
+    unlock: [...unlock],
+    locks,
+    solution: {
+      assignment: searchResult.assignment,
+      changes: searchResult.changes,
+      totalDelta: searchResult.totalDelta,
+    },
+    worstProfile,
+    worstRatio,
+    report,
+  };
+}
+
+/**
+ * 最小解锁恢复诊断。仅在求解无解且存在锁定令牌时调用。
+ *
+ * 流程：
+ *   1. 自反约束（前景=背景且 min>1）下任何配色都不可行，直接判定 none；
+ *   2. 先检查“全部解锁”：若仍不可行，则任何子集都不可行，判定 none；
+ *   3. 按解锁数量 k=1,2,… 递增枚举组合，复用 runSearch（同一优化目标）
+ *      判定可行性并顺带得到恢复后最优解；第一个出现可行集合的 k 即最小
+ *      解锁数，该层全部可行集合即所有最小解锁集合；
+ *   4. 全部搜索共享一个诊断节点预算；预算在任一环节耗尽都返回
+ *      incomplete（诊断未完成），绝不误报 none。
+ *
+ * 返回对象可直接序列化进 API 响应的 recovery 字段。
+ */
+function diagnoseUnlockRecovery(input, model, pre, hasSelfConflict, options) {
+  const startTime = Date.now();
+  const nodeBudget = options.recoveryNodeBudget || DEFAULT_RECOVERY_NODE_BUDGET;
+  const lockedNames = model.tokenNames
+    .filter((name) => model.tokens.get(name).locked)
+    .sort();
+  const originallyLocked = new Map(
+    model.tokenNames.map((name) => [name, model.tokens.get(name).locked])
+  );
+
+  let nodesUsed = 0;
+  let combosChecked = 0;
+  const result = {
+    status: 'incomplete',
+    minUnlocks: null,
+    totalSets: 0,
+    returnedSets: 0,
+    truncated: false,
+    sets: [],
+    checkedUnlockSizes: [],
+    combosChecked: 0,
+    nodeBudget,
+  };
+  const finish = (fields) => {
+    Object.assign(result, fields, {
+      combosChecked,
+      stats: { nodes: nodesUsed, elapsedMs: Date.now() - startTime },
+    });
+    return result;
+  };
+
+  if (hasSelfConflict) {
+    return finish({
+      status: 'none',
+      reason: 'self-conflict',
+      message:
+        '诊断完成：存在前景与背景相同的约束（任何颜色与自身的对比度恒为 1），' +
+        '解锁令牌无法恢复可行，没有可用的解锁恢复方案。',
+    });
+  }
+
+  // 应用一个解锁组合并搜索；结果按组合缓存（全解锁检查与 k=n 层会重合）。
+  const cache = new Map();
+  const tryCombo = (combo) => {
+    const key = JSON.stringify(combo);
+    if (cache.has(key)) return cache.get(key);
+    combosChecked++;
+    const unlock = new Set(combo);
+    for (const name of model.tokenNames) {
+      const token = model.tokens.get(name);
+      const locked = originallyLocked.get(name) && !unlock.has(name);
+      token.locked = locked;
+      token.domain = locked ? [token.original] : token.fullDomain;
+    }
+
+    // 两端都被锁定的约束不含任何搜索变量，runSearch 不会检验它们
+    // （正常流程由 findDirectLockConflicts 前置拦截），这里必须直接核验。
+    let lockedPairViolated = false;
+    for (const con of pre.activeConstraints) {
+      const ta = model.tokens.get(con.a);
+      const tb = model.tokens.get(con.b);
+      if (!ta.locked || !tb.locked) continue;
+      const giA = pre.indexOf.get(ta.original);
+      const giB = pre.indexOf.get(tb.original);
+      for (let p = 0; p < pre.ratioByProfile.length; p++) {
+        if (pre.ratioByProfile[p][giA * pre.n + giB] < con.min) {
+          lockedPairViolated = true;
+          break;
+        }
+      }
+      if (lockedPairViolated) break;
+    }
+
+    const remaining = nodeBudget - nodesUsed;
+    let r;
+    if (lockedPairViolated) {
+      r = { status: 'unsatisfiable', stats: { nodes: 0, elapsedMs: 0 } };
+    } else if (remaining <= 0) {
+      r = { status: 'search-limit', stats: { nodes: 0, elapsedMs: 0 } };
+    } else {
+      r = runSearch(model, pre, { nodeBudget: remaining });
+    }
+    nodesUsed += r.stats.nodes;
+    cache.set(key, r);
+    return r;
+  };
+
+  // 第 1 步：全部解锁仍不可行 -> 任何解锁子集都不可行（单调性）。
+  const full = tryCombo(lockedNames);
+  if (full.status === 'search-limit') {
+    return finish({
+      status: 'incomplete',
+      reason: 'node-budget',
+      message:
+        `诊断未完成：诊断节点预算（${nodeBudget}）在“全部解锁”可行性检查阶段即耗尽；` +
+        '不能排除存在解锁恢复方案，可减少锁定令牌数量或简化问题后重试。',
+    });
+  }
+  if (full.status !== 'optimal') {
+    return finish({
+      status: 'none',
+      reason: 'no-assignment',
+      message:
+        `诊断完成：即使解锁全部 ${lockedNames.length} 个锁定令牌也不存在可行配色，` +
+        '没有可用的解锁恢复方案；请调整候选色、约束或视型。',
+    });
+  }
+
+  // 第 2 步：按解锁数量递增枚举；第一个有可行集合的 k 即最小解锁数。
+  for (let k = 1; k <= lockedNames.length; k++) {
+    const found = [];
+    let exhausted = false;
+    for (const combo of combinations(lockedNames, k)) {
+      const r = tryCombo(combo);
+      if (r.status === 'search-limit') {
+        exhausted = true;
+        break;
+      }
+      if (r.status === 'optimal') found.push({ unlock: combo, search: r });
+    }
+
+    if (found.length > 0) {
+      const sets = found
+        .slice(0, MAX_RECOVERY_SETS)
+        .map((f) => buildRecoverySet(input, model, originallyLocked, f.unlock, f.search));
+      const truncated = found.length > MAX_RECOVERY_SETS || exhausted;
+      if (exhausted) {
+        // 已确认的集合确实最小（更小的 k 已完整枚举且无可行），但本层枚举不完整。
+        return finish({
+          status: 'incomplete',
+          reason: 'node-budget',
+          minUnlocks: k,
+          totalSets: found.length,
+          returnedSets: sets.length,
+          truncated: true,
+          sets,
+          message:
+            `诊断未完成：已确认解锁 ${k} 个令牌可恢复可行（部分集合如下），` +
+            `但诊断节点预算（${nodeBudget}）耗尽，本层枚举不完整，` +
+            '可能还有更多同等大小的解锁集合。',
+        });
+      }
+      return finish({
+        status: 'ok',
+        minUnlocks: k,
+        totalSets: found.length,
+        returnedSets: sets.length,
+        truncated,
+        sets,
+        message:
+          `诊断完成：解锁最少 ${k} 个锁定令牌即可恢复可行，共 ${found.length} 个最小解锁集合` +
+          (truncated ? `，按令牌名序列排序后仅返回前 ${sets.length} 个` : '') +
+          '。',
+      });
+    }
+
+    if (exhausted) {
+      return finish({
+        status: 'incomplete',
+        reason: 'node-budget',
+        message:
+          `诊断未完成：已证明解锁 ${result.checkedUnlockSizes.join('、')} 个令牌均无法恢复可行，` +
+          `但诊断节点预算（${nodeBudget}）在枚举解锁 ${k} 个令牌的组合时耗尽；` +
+          '不能排除更多解锁可恢复，可减少锁定令牌数量后重试。',
+      });
+    }
+    result.checkedUnlockSizes.push(k);
+  }
+
+  // 不可达：全部解锁可行保证了某个 k 必有可行集合。防御性返回，绝不误报 none。
+  return finish({
+    status: 'incomplete',
+    reason: 'unexpected',
+    message: '诊断未完成：枚举意外终止，不能排除存在解锁恢复方案。',
+  });
+}
+
+/**
  * 求解入口。返回值可直接序列化为 API 响应。
+ * 无解且存在锁定令牌时，自动附加 recovery 字段（最小解锁恢复诊断）；
+ * 可用 options.recovery === false 关闭，options.recoveryNodeBudget 调整诊断预算。
  */
 function solve(input, locks, options = {}) {
   const model = parseModel(input, locks);
@@ -631,53 +893,72 @@ function solve(input, locks, options = {}) {
       activeConstraints.push(con);
     }
   }
+
+  let result;
+  let pre = null;
   if (selfConflicts.length > 0) {
-    return {
+    result = {
       status: 'unsatisfiable',
       reason: 'direct-conflict',
       profiles: model.profiles,
       conflicts: selfConflicts,
       stats: { nodes: 0, elapsedMs: 0 },
     };
+  } else {
+    pre = preprocess(model, activeConstraints);
+
+    const directConflicts = findDirectLockConflicts(model, activeConstraints, pre);
+    if (directConflicts.length > 0) {
+      result = {
+        status: 'unsatisfiable',
+        reason: 'locked-conflict',
+        profiles: model.profiles,
+        conflicts: directConflicts,
+        stats: { nodes: 0, elapsedMs: 0 },
+      };
+    } else {
+      const search = runSearch(model, pre, options);
+      if (search.status === 'unsatisfiable') {
+        result = {
+          status: 'unsatisfiable',
+          reason: 'global',
+          profiles: model.profiles,
+          conflicts: [],
+          message:
+            '不存在同时满足全部约束的配色方案；未发现由锁定颜色直接导致的冲突，' +
+            '不可行性可能由多条约束与候选色范围共同造成。',
+          stats: search.stats,
+        };
+      } else if (search.status === 'search-limit') {
+        result = {
+          status: 'search-limit',
+          reason: 'node-budget',
+          profiles: model.profiles,
+          message: `搜索节点数超过上限（${search.nodeBudget}），请放宽约束或增加候选色后重试。`,
+          best: search.best,
+          stats: search.stats,
+        };
+      } else {
+        search.profiles = model.profiles;
+        result = search;
+      }
+    }
   }
 
-  const pre = preprocess(model, activeConstraints);
-
-  const directConflicts = findDirectLockConflicts(model, activeConstraints, pre);
-  if (directConflicts.length > 0) {
-    return {
-      status: 'unsatisfiable',
-      reason: 'locked-conflict',
-      profiles: model.profiles,
-      conflicts: directConflicts,
-      stats: { nodes: 0, elapsedMs: 0 },
-    };
+  // 最小解锁恢复诊断：仅在确认无解且存在锁定令牌时触发。
+  if (result.status === 'unsatisfiable' && options.recovery !== false) {
+    const hasLocked = model.tokenNames.some((name) => model.tokens.get(name).locked);
+    if (hasLocked) {
+      result.recovery = diagnoseUnlockRecovery(
+        input,
+        model,
+        pre,
+        selfConflicts.length > 0,
+        options
+      );
+    }
   }
 
-  const result = runSearch(model, pre, options);
-  if (result.status === 'unsatisfiable') {
-    return {
-      status: 'unsatisfiable',
-      reason: 'global',
-      profiles: model.profiles,
-      conflicts: [],
-      message:
-        '不存在同时满足全部约束的配色方案；未发现由锁定颜色直接导致的冲突，' +
-        '不可行性可能由多条约束与候选色范围共同造成。',
-      stats: result.stats,
-    };
-  }
-  if (result.status === 'search-limit') {
-    return {
-      status: 'search-limit',
-      reason: 'node-budget',
-      profiles: model.profiles,
-      message: `搜索节点数超过上限（${result.nodeBudget}），请放宽约束或增加候选色后重试。`,
-      best: result.best,
-      stats: result.stats,
-    };
-  }
-  result.profiles = model.profiles;
   return result;
 }
 
@@ -773,6 +1054,8 @@ module.exports = {
   MAX_TOKENS,
   MAX_CANDIDATES,
   MAX_CONSTRAINTS,
+  DEFAULT_RECOVERY_NODE_BUDGET,
+  MAX_RECOVERY_SETS,
   SolverError,
   parseModel,
   solve,

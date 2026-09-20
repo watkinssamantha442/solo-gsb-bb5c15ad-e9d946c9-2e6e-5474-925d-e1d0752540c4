@@ -29,6 +29,11 @@ const els = {
   conflictArea: $('conflictArea'),
   conflictIntro: $('conflictIntro'),
   conflictList: $('conflictList'),
+  recoveryArea: $('recoveryArea'),
+  recoveryAlert: $('recoveryAlert'),
+  recoveryIntro: $('recoveryIntro'),
+  recoveryList: $('recoveryList'),
+  recoveryMeta: $('recoveryMeta'),
   limitArea: $('limitArea'),
 };
 
@@ -110,6 +115,7 @@ function clearResultViews() {
   els.resultPlaceholder.textContent = '运行求解后在此查看结果。';
   els.resultArea.hidden = true;
   els.conflictArea.hidden = true;
+  els.recoveryArea.hidden = true;
   els.limitArea.hidden = true;
   lastExport = null;
 }
@@ -397,6 +403,7 @@ function renderResult(body) {
 
   if (body.status === 'unsatisfiable') {
     renderConflicts(body);
+    renderRecovery(body.recovery);
     return;
   }
 
@@ -586,6 +593,150 @@ function renderConflicts(body) {
     }
     els.conflictList.appendChild(li);
   }
+}
+
+// ---------- 最小解锁恢复 ----------
+
+// 渲染无解时的最小解锁恢复诊断。recovery 缺失（无锁定令牌）时保持隐藏。
+function renderRecovery(recovery) {
+  if (!recovery) {
+    els.recoveryArea.hidden = true;
+    return;
+  }
+  els.recoveryArea.hidden = false;
+  els.recoveryList.innerHTML = '';
+
+  // 诊断级别提示：预算耗尽（未完成）与确认无恢复方案用醒目条展示。
+  if (recovery.status === 'incomplete') {
+    els.recoveryAlert.className = 'alert alert-warn';
+    els.recoveryAlert.textContent =
+      recovery.message || '诊断未完成：诊断节点预算耗尽，不能排除存在恢复方案。';
+    els.recoveryAlert.hidden = false;
+  } else if (recovery.status === 'none') {
+    els.recoveryAlert.className = 'alert alert-info';
+    els.recoveryAlert.textContent =
+      recovery.message || '诊断完成：不存在可恢复可行的解锁集合。';
+    els.recoveryAlert.hidden = false;
+  } else {
+    els.recoveryAlert.hidden = true;
+    els.recoveryAlert.textContent = '';
+  }
+
+  if (recovery.status === 'ok') {
+    els.recoveryIntro.hidden = false;
+    els.recoveryIntro.textContent =
+      `解锁最少 ${recovery.minUnlocks} 个锁定令牌即可恢复可行，` +
+      `共 ${recovery.totalSets} 个最小解锁集合` +
+      (recovery.truncated ? `，按令牌名序列排序后仅显示前 ${recovery.returnedSets} 个` : '') +
+      '。每个集合均给出恢复原优化目标（最少改色 → 最小总色差）后的最优配色。';
+  } else if (recovery.status === 'incomplete' && (recovery.sets || []).length > 0) {
+    els.recoveryIntro.hidden = false;
+    els.recoveryIntro.textContent =
+      '以下为已确认可恢复可行的最小解锁集合（枚举未完成，可能遗漏同等大小的其他集合）：';
+  } else {
+    els.recoveryIntro.hidden = true;
+    els.recoveryIntro.textContent = '';
+  }
+
+  const stats = recovery.stats || { nodes: 0, elapsedMs: 0 };
+  els.recoveryMeta.textContent =
+    `诊断节点 ${Number(stats.nodes).toLocaleString('zh-CN')} / 预算 ` +
+    `${Number(recovery.nodeBudget).toLocaleString('zh-CN')}` +
+    ` · 枚举组合 ${recovery.combosChecked} 个 · 耗时 ${stats.elapsedMs} ms`;
+
+  (recovery.sets || []).forEach((set, i) => {
+    els.recoveryList.appendChild(buildRecoveryCard(set, i));
+  });
+}
+
+// 单个最小解锁集合卡片：需解锁令牌、恢复后概要（改色数/总色差/最差视型）、
+// 改色明细表与“应用此解锁集合并重新求解”按钮。
+function buildRecoveryCard(set, index) {
+  const card = document.createElement('div');
+  card.className = 'recovery-card';
+
+  const head = document.createElement('div');
+  head.className = 'recovery-head';
+
+  const titleWrap = document.createElement('div');
+  const title = document.createElement('div');
+  title.className = 'recovery-title';
+  title.textContent = `方案 ${index + 1}：解锁 ${set.unlock.length} 个令牌`;
+  const chips = document.createElement('div');
+  chips.className = 'unlock-chips';
+  const tokenByName = new Map((set.report.tokens || []).map((t) => [t.name, t]));
+  for (const name of set.unlock) {
+    const chip = document.createElement('span');
+    chip.className = 'unlock-chip';
+    const token = tokenByName.get(name);
+    if (token) {
+      const sw = document.createElement('span');
+      sw.className = 'swatch';
+      sw.style.background = token.original;
+      chip.appendChild(sw);
+    }
+    const label = document.createElement('span');
+    label.textContent = '🔓 ' + name;
+    chip.appendChild(label);
+    chips.appendChild(chip);
+  }
+  titleWrap.append(title, chips);
+
+  const applyBtn = document.createElement('button');
+  applyBtn.type = 'button';
+  applyBtn.className = 'btn btn-primary recovery-apply';
+  applyBtn.textContent = '应用此解锁集合并重新求解';
+  applyBtn.addEventListener('click', () => applyUnlockSet(set));
+
+  head.append(titleWrap, applyBtn);
+
+  const summary = document.createElement('div');
+  summary.className = 'summary';
+  summary.append(
+    stat(set.solution.changes, '改色令牌数', true),
+    stat(Number(set.solution.totalDelta).toFixed(2), 'CIE Lab 总色差 ΔE*ab'),
+    stat(
+      set.worstProfile ? PROFILE_LABELS[set.worstProfile] || set.worstProfile : '—',
+      '最差视型'
+    ),
+    stat(set.worstRatio != null ? ratioText(set.worstRatio) : '—', '最差视型改后对比度')
+  );
+
+  const detailLabel = document.createElement('div');
+  detailLabel.className = 'hint';
+  detailLabel.textContent = '改色明细（恢复后最优配色）：';
+
+  const changed = (set.report.tokens || []).filter((t) => t.changed);
+  const tableWrap = document.createElement('div');
+  tableWrap.appendChild(
+    buildTable(
+      ['令牌', '原色', '', '改后', 'ΔE'],
+      changed.map((t) => [
+        t.name,
+        colorCell(t.original),
+        '→',
+        colorCell(t.final),
+        { num: t.deltaE.toFixed(2) },
+      ])
+    )
+  );
+
+  card.append(head, summary, detailLabel, tableWrap);
+  return card;
+}
+
+// 一键应用：将该集合的令牌设为未锁定，同步回输入 JSON 并自动重新求解。
+// 走统一的版本化提交（beginInput/commitInput），在途的旧响应会被丢弃。
+function applyUnlockSet(set) {
+  if (!parsed || !Array.isArray(parsed.tokens)) return;
+  const names = new Set(set.unlock);
+  for (const t of parsed.tokens) {
+    if (t && names.has(t.name)) t.locked = false;
+  }
+  syncParsedIntoText();
+  beginInput();
+  commitInput();
+  els.solveBtn.click();
 }
 
 // ---------- 导出 ----------
