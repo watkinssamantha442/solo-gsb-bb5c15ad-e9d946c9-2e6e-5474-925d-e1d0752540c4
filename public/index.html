@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>对比度调色板求解器</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <h1>对比度调色板求解器</h1>
+    <p class="subtitle">
+      导入颜色令牌、候选色与 WCAG 对比度约束，锁定任意令牌后进行全局分支定界搜索：
+      先最小化改色令牌数，再最小化 CIE Lab 总色差。可启用色觉鲁棒模式，要求每条约束
+      在正常视觉与所选色盲视型下同时达标。所有数据仅在本机浏览器与本地服务内存中处理。
+    </p>
+  </header>
+
+  <main class="layout">
+    <!-- 左栏：输入 -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>1. 输入数据</h2>
+        <div class="btn-row">
+          <button id="loadSampleBtn" type="button" class="btn btn-ghost">载入示例</button>
+          <label class="btn btn-ghost file-label">
+            导入 JSON
+            <input id="fileInput" type="file" accept=".json,application/json" hidden />
+          </label>
+        </div>
+      </div>
+      <p class="hint">
+        上限：10 个令牌 · 12 个候选色 · 30 条约束。约束字段：
+        <code>foreground</code> / <code>background</code>（令牌名）与 <code>minContrast</code>（1–21）。
+        可选 <code>profiles</code> 字段声明色觉视型（缺省仅 <code>normal</code>）。
+      </p>
+      <textarea id="jsonInput" spellcheck="false" placeholder='{
+  "tokens": [ { "name": "text", "color": "#888888", "locked": false } ],
+  "candidates": [ "#000000", "#ffffff" ],
+  "constraints": [ { "foreground": "text", "background": "bg", "minContrast": 4.5 } ]
+}'></textarea>
+      <div id="parseError" class="alert alert-error" hidden></div>
+
+      <h2 class="mt">2. 锁定令牌</h2>
+      <p class="hint">被锁定的令牌保留原色，不参与改色。</p>
+      <div id="tokenLocks" class="lock-grid">
+        <div class="hint" id="lockEmpty">尚未载入有效数据。</div>
+      </div>
+
+      <h2 class="mt">3. 色觉鲁棒视型</h2>
+      <p class="hint">
+        每条约束必须在全部勾选视型下都达到 minContrast；仅勾选 normal 等同未启用。
+        勾选结果会同步为输入 JSON 的 <code>profiles</code> 字段。
+      </p>
+      <div id="profileList" class="profile-grid"></div>
+
+      <div class="btn-row mt">
+        <button id="solveBtn" type="button" class="btn btn-primary" disabled>运行求解</button>
+        <span id="inputMeta" class="hint"></span>
+      </div>
+    </section>
+
+    <!-- 右栏：结果 -->
+    <section class="panel">
+      <h2>4. 求解结果</h2>
+      <div id="resultPlaceholder" class="hint">运行求解后在此查看结果。</div>
+
+      <div id="resultArea" hidden>
+        <div id="resultSummary"></div>
+
+        <h3 class="mt">约束对比度（各视型 · 改前 → 改后）</h3>
+        <div id="constraintTable"></div>
+
+        <h3 class="mt">令牌改色明细</h3>
+        <div id="tokenTable"></div>
+
+        <div class="btn-row mt">
+          <button id="exportBtn" type="button" class="btn btn-primary">导出替换后的令牌 JSON</button>
+        </div>
+      </div>
+
+      <div id="conflictArea" hidden>
+        <h3>无解：锁定颜色直接造成的冲突</h3>
+        <p id="conflictIntro" class="hint"></p>
+        <ul id="conflictList" class="conflict-list"></ul>
+      </div>
+
+      <div id="limitArea" class="alert alert-warn" hidden></div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    数据仅在本机内存处理，不会发送到任何外部服务 · 访问地址 <code>http://localhost:3000</code>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

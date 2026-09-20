@@ -1,0 +1,25 @@
+# 唯一启动命令：docker compose up --build
+# 构建时自动安装依赖；启动后访问 http://localhost:3000
+services:
+  contrast-palette-solver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: contrast-palette-solver:latest
+    container_name: contrast-palette-solver
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s

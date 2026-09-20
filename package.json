@@ -1,0 +1,21 @@
+{
+  "name": "contrast-palette-solver",
+  "version": "1.0.0",
+  "description": "WCAG 对比度调色板求解器：全局分支定界搜索，最小化改色令牌数与 CIE Lab 总色差",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node scripts/test-solver.js",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.2"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "name": "示例产品主题",
+  "tokens": [
+    { "name": "bg", "color": "#f8fafc", "locked": true },
+    { "name": "surface", "color": "#ffffff", "locked": true },
+    { "name": "textPrimary", "color": "#1f2937" },
+    { "name": "textMuted", "color": "#6b7280" },
+    { "name": "primary", "color": "#2563eb" },
+    { "name": "primaryText", "color": "#1d4ed8" },
+    { "name": "danger", "color": "#f87171" },
+    { "name": "border", "color": "#d1d5db" }
+  ],
+  "candidates": [
+    "#0f172a",
+    "#111827",
+    "#1f2937",
+    "#4b5563",
+    "#6b7280",
+    "#1d4ed8",
+    "#2563eb",
+    "#dc2626",
+    "#b91c1c",
+    "#f8fafc",
+    "#ffffff",
+    "#e5e7eb"
+  ],
+  "constraints": [
+    { "foreground": "textPrimary", "background": "bg", "minContrast": 7 },
+    { "foreground": "textPrimary", "background": "surface", "minContrast": 4.5 },
+    { "foreground": "textMuted", "background": "bg", "minContrast": 4.5 },
+    { "foreground": "primary", "background": "bg", "minContrast": 4.5 },
+    { "foreground": "primaryText", "background": "primary", "minContrast": 4.5 },
+    { "foreground": "danger", "background": "bg", "minContrast": 4.5 },
+    { "foreground": "border", "background": "bg", "minContrast": 1.3 }
+  ]
+}

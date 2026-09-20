@@ -1,0 +1,8 @@
+node_modules/
+npm-debug.log*
+.DS_Store
+*.log
+
+# Playwright 浏览器测试产物
+test-results/
+playwright-report/
